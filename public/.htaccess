@@ -1,0 +1,71 @@
+# ==============================================================================
+# ONIVAL Security & Hardening Configuration for Apache / LiteSpeed / cPanel
+# ==============================================================================
+
+# 1. Prevent Directory Browsing
+Options -Indexes
+
+# 2. Block direct HTTP access to sensitive files, configs, databases, and logs
+<FilesMatch "(^#.*#|\.(bak|conf|dist|fla|in[ci]|log|psd|sh|sql|sw[op]|env.*|json|lock|yml|yaml|ts|tsx|md)|session_secret|\.session_secret)$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
+
+# Specifically forbid direct access to sensitive system files
+<Files ".session_secret">
+    Order allow,deny
+    Deny from all
+</Files>
+
+<Files "onival-persistent-data.json">
+    Order allow,deny
+    Deny from all
+</Files>
+
+<Files ".env">
+    Order allow,deny
+    Deny from all
+</Files>
+
+<Files "server.cjs">
+    Order allow,deny
+    Deny from all
+</Files>
+
+<Files "server.ts">
+    Order allow,deny
+    Deny from all
+</Files>
+
+<Files "package.json">
+    Order allow,deny
+    Deny from all
+</Files>
+
+<Files "bun.lock">
+    Order allow,deny
+    Deny from all
+</Files>
+
+# 3. Security Headers
+<IfModule mod_headers.c>
+    Header set X-Content-Type-Options "nosniff"
+    Header set X-XSS-Protection "1; mode=block"
+    Header set Referrer-Policy "strict-origin-when-cross-origin"
+    Header set Permissions-Policy "geolocation=(), microphone=(), camera=()"
+</IfModule>
+
+# 4. API Backend & SPA URL Rewriting
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # Route all /api and /api/* requests to PHP backend
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteRule ^api(?:/(.*))?$ api/index.php?path=$1 [QSA,L]
+
+    # SPA Fallback for all other frontend routes
+    RewriteRule ^index\.html$ - [L]
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule . index.html [L]
+</IfModule>

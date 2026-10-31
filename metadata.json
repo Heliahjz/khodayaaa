@@ -1,0 +1,8 @@
+{
+  "name": "اونیوال (ONIVAL) - فروشگاه محصولات ارگانیک",
+  "description": "فروشگاه تخصصی محصولات ارگانیک اونیوال (ONIVAL) با پیشنهاد شگفت‌انگیز، مشاوره تخصصی، اتصال به ربات بله، سایزبندی پویا و پیگیری لحظه‌ای سفارش",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
