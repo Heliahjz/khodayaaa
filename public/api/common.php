@@ -983,8 +983,7 @@ function runDiagnosticsSuite($db, $options = []) {
     $stages = [];
     $correlationId = substr(bin2hex(random_bytes(8)), 0, 12);
     $tgCfg = $db['telegramConfig'] ?? [];
-    $adminChatId = trim((string)($tgCfg['adminChatId'] ?? $tgCfg['baleAdminChatId'] ?? '69451465'));
-    if (empty($adminChatId)) $adminChatId = '69451465';
+    $adminChatId = trim((string)($tgCfg['adminChatId'] ?? $tgCfg['baleAdminChatId'] ?? ''));
 
     $customerToken = trim((string)($tgCfg['customerBotToken'] ?? $tgCfg['baleBotToken'] ?? $tgCfg['botToken'] ?? ''));
     $adminToken = trim((string)($tgCfg['adminBotToken'] ?? $tgCfg['baleAdminBotToken'] ?? ''));
@@ -1289,3 +1288,121 @@ function runDiagnosticsSuite($db, $options = []) {
         'stages' => $stages
     ];
 }
+
+// ------------------------------------------------------------------------------
+// 11. Unified Panel Log Adapter (Bounded Tail-Read & Schema Translation)
+// ------------------------------------------------------------------------------
+/**
+ * Reads recent structured events from app.log with bounded tail reading
+ * and maps them to the unified frontend format:
+ * { id, time, timestamp, type, platform, text, status, details }
+ */
+function getRecentBotActivityLogsPhp($maxItems = 50, $bytesToRead = 65536) {
+    global $logFile;
+    if (!file_exists($logFile)) {
+        return [];
+    }
+
+    $fileSize = @filesize($logFile);
+    if ($fileSize === 0 || $fileSize === false) {
+        return [];
+    }
+
+    $fp = @fopen($logFile, 'rb');
+    if (!$fp) {
+        return [];
+    }
+
+    $readLength = min($fileSize, $bytesToRead);
+    $offset = max(0, $fileSize - $readLength);
+    fseek($fp, $offset);
+    $chunk = fread($fp, $readLength);
+    fclose($fp);
+
+    if ($chunk === false || $chunk === '') {
+        return [];
+    }
+
+    // If we didn't read from the start of the file, drop the leading partial line
+    if ($offset > 0) {
+        $firstNewline = strpos($chunk, "\n");
+        if ($firstNewline !== false) {
+            $chunk = substr($chunk, $firstNewline + 1);
+        }
+    }
+
+    $lines = explode("\n", $chunk);
+    $events = [];
+
+    // Process lines in reverse order (newest first)
+    for ($i = count($lines) - 1; $i >= 0; $i--) {
+        $line = trim($lines[$i]);
+        if ($line === '') continue;
+
+        $entry = @json_decode($line, true);
+        if (!is_array($entry)) continue;
+
+        $timestamp = (string)($entry['timestamp'] ?? '');
+        $stage = (string)($entry['stage'] ?? '');
+        $category = (string)($entry['category'] ?? '');
+        $rawMessage = (string)($entry['message'] ?? '');
+        $correlationId = (string)($entry['correlationId'] ?? '');
+        $context = is_array($entry['context'] ?? null) ? $entry['context'] : [];
+
+        // Redact any sensitive tokens, secrets, or raw keys in the message
+        $cleanMessage = preg_replace('/(?::|token=|secret=)[a-zA-Z0-9_-]{16,}/i', ':***', $rawMessage);
+        $cleanMessage = preg_replace('/[a-zA-Z0-9_-]{32,}/', '***', $cleanMessage);
+
+        // Derive status explicitly without inventing false success
+        $status = 'info';
+        $lowCategory = strtolower($category);
+        $lowStage = strtolower($stage);
+        if (strpos($lowCategory, 'error') !== false || strpos($lowCategory, 'fail') !== false || strpos($lowCategory, 'critical') !== false || strpos($lowCategory, 'exception') !== false || strpos($lowCategory, 'rejected') !== false || strpos($lowCategory, 'conflict') !== false) {
+            $status = 'error';
+        } elseif (strpos($lowCategory, 'warn') !== false || strpos($lowCategory, 'review') !== false || strpos($lowCategory, 'pending') !== false || strpos($lowCategory, 'underpaid') !== false) {
+            $status = 'warning';
+        } elseif (strpos($lowCategory, 'success') !== false || strpos($lowCategory, 'approved') !== false || strpos($lowCategory, 'verified') !== false || strpos($lowCategory, 'saved') !== false || strpos($lowCategory, 'uploaded') !== false) {
+            $status = 'success';
+        }
+
+        // Derive platform
+        $platform = 'bale';
+        if (strpos($lowStage, 'telegram') !== false || strpos($lowCategory, 'telegram') !== false) {
+            $platform = 'telegram';
+        } elseif (strpos($lowStage, 'database') !== false || strpos($lowStage, 'account') !== false) {
+            $platform = 'system';
+        }
+
+        // Derive readable Persian/standard time
+        $timeStr = date('H:i:s');
+        if (!empty($timestamp)) {
+            $ts = strtotime($timestamp);
+            if ($ts !== false) {
+                $timeStr = date('H:i:s', $ts);
+            }
+        }
+
+        // Derive stable unique integer ID for React key and item selection
+        $idSeed = $timestamp . '_' . $correlationId . '_' . $stage . '_' . $category . '_' . $i;
+        $stableId = (int)sprintf('%u', crc32($idSeed));
+        if ($stableId <= 0) $stableId = abs(crc32($idSeed)) ?: ($i + 1);
+
+        $events[] = [
+            'id' => $stableId,
+            'time' => $timeStr,
+            'timestamp' => $timestamp,
+            'type' => !empty($category) ? $category : $stage,
+            'platform' => $platform,
+            'text' => $cleanMessage,
+            'status' => $status,
+            'details' => !empty($context) ? json_encode($context, JSON_UNESCAPED_UNICODE) : null
+        ];
+
+        if (count($events) >= $maxItems) {
+            break;
+        }
+    }
+
+    return $events;
+}
+

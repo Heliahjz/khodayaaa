@@ -1808,38 +1808,62 @@ if ($path === '/api/stats' && $method === 'GET') {
     exit;
 }
 
-if (preg_match('#^/api/admin/receipts/([a-zA-Z0-9._-]+)$#', $path, $m) && $method === 'GET') {
-    $reqAuth = false;
-    if (isRequestAdminAuthorized($db)) {
-        $reqAuth = true;
-    } elseif (!empty($_GET['token'])) {
-        $_SERVER['HTTP_AUTHORIZATION'] = 'Bearer ' . $_GET['token'];
-        if (isRequestAdminAuthorized($db)) {
-            $reqAuth = true;
-        }
-    }
-
-    if (!$reqAuth) {
+if (preg_match('#^/api/(?:admin/)?receipts/([a-zA-Z0-9._-]+)$#', $path, $m) && $method === 'GET') {
+    if (!isRequestAdminAuthorized($db)) {
         http_response_code(401);
-        echo json_encode(['ok' => false, 'code' => 'AUTH_REQUIRED', 'error' => 'Unauthorized']);
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store, private');
+        echo json_encode(['ok' => false, 'code' => 'AUTH_REQUIRED', 'error' => 'دسترسی غیرمجاز. ورود به پنل مدیریت الزامی است.']);
         exit;
     }
 
-    $fileName = basename($m[1]);
-    $filePath = $receiptsDir . '/' . $fileName;
+    $rawFileName = $m[1];
+    $cleanFileName = basename($rawFileName);
+    if ($cleanFileName !== $rawFileName || !preg_match('/^[a-zA-Z0-9._-]+\.(jpg|jpeg|png|webp)$/i', $cleanFileName)) {
+        http_response_code(400);
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store, private');
+        echo json_encode(['ok' => false, 'code' => 'INVALID_FILENAME', 'error' => 'نام فایل نامعتبر است']);
+        exit;
+    }
 
-    if (!file_exists($filePath)) {
+    $resolvedReceiptsDir = realpath($receiptsDir);
+    if (!$resolvedReceiptsDir || !is_dir($resolvedReceiptsDir)) {
         http_response_code(404);
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store, private');
+        echo json_encode(['ok' => false, 'code' => 'NOT_FOUND', 'error' => 'پوشه فیش‌ها یافت نشد']);
+        exit;
+    }
+
+    $filePath = $resolvedReceiptsDir . DIRECTORY_SEPARATOR . $cleanFileName;
+    $realFilePath = realpath($filePath);
+
+    if (!$realFilePath || strpos($realFilePath, $resolvedReceiptsDir) !== 0 || !file_exists($realFilePath)) {
+        http_response_code(404);
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store, private');
         echo json_encode(['ok' => false, 'code' => 'NOT_FOUND', 'error' => 'فایل رسید یافت نشد']);
         exit;
     }
 
-    header('Content-Security-Policy: default-src \'none\'; img-src \'self\' data:; style-src \'unsafe-inline\'');
-    header('X-Content-Type-Options: nosniff');
-    $mime = mime_content_type($filePath) ?: 'image/jpeg';
+    $mime = mime_content_type($realFilePath) ?: 'image/jpeg';
+    if (!in_array($mime, ['image/jpeg', 'image/png', 'image/webp'], true)) {
+        http_response_code(403);
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store, private');
+        echo json_encode(['ok' => false, 'code' => 'FORBIDDEN_FILE_TYPE', 'error' => 'نوع فایل مجاز نمی‌باشد']);
+        exit;
+    }
+
     header('Content-Type: ' . $mime);
-    header('Content-Length: ' . filesize($filePath));
-    readfile($filePath);
+    header('Content-Length: ' . filesize($realFilePath));
+    header('Cache-Control: no-store, private, no-cache, must-revalidate');
+    header('Pragma: no-cache');
+    header('Expires: 0');
+    header('X-Content-Type-Options: nosniff');
+    header('Content-Security-Policy: default-src \'none\'');
+    readfile($realFilePath);
     exit;
 }
 
@@ -1863,7 +1887,7 @@ if ($path === '/api/bot/config' && $method === 'GET') {
     echo json_encode([
         'ok' => true,
         'config' => $safe,
-        'logs' => $db['botActivityLogs'] ?? []
+        'logs' => getRecentBotActivityLogsPhp()
     ]);
     exit;
 }
@@ -1874,6 +1898,8 @@ if ($path === '/api/bot/config' && $method === 'POST') {
     $curTg = $db['telegramConfig'] ?? [];
     $newCustomerToken = trim((string)($body['customerBotToken'] ?? $body['botToken'] ?? ''));
     $newAdminToken = trim((string)($body['adminBotToken'] ?? ''));
+    $verifiedCustomerUsername = '';
+    $verifiedAdminUsername = '';
 
     // Validate newly provided customer token with getMe outside the DB lock
     if (!empty($newCustomerToken) && !preg_match('/^\*+|\[REDACTED\]/i', $newCustomerToken)) {
@@ -1889,6 +1915,7 @@ if ($path === '/api/bot/config' && $method === 'POST') {
                 ]);
                 exit;
             }
+            $verifiedCustomerUsername = trim((string)($testMe['result']['username'] ?? ''));
         }
     }
 
@@ -1906,10 +1933,11 @@ if ($path === '/api/bot/config' && $method === 'POST') {
                 ]);
                 exit;
             }
+            $verifiedAdminUsername = trim((string)($testMeAdmin['result']['username'] ?? ''));
         }
     }
 
-    $saved = withDatabaseTransaction(function(&$dbRef) use ($body) {
+    $saved = withDatabaseTransaction(function(&$dbRef) use ($body, $verifiedCustomerUsername, $verifiedAdminUsername) {
         if (!isset($dbRef['telegramConfig'])) $dbRef['telegramConfig'] = [];
         $cur = &$dbRef['telegramConfig'];
 
@@ -1936,6 +1964,18 @@ if ($path === '/api/bot/config' && $method === 'POST') {
                 $cur[$nk] = $body[$nk];
             }
         }
+
+        // Commit verified usernames derived directly from getMe on the server (overriding stale client inputs)
+        if (!empty($verifiedCustomerUsername)) {
+            $cur['customerBotUsername'] = $verifiedCustomerUsername;
+            $cur['baleBotUsername'] = $verifiedCustomerUsername;
+            $cur['botUsername'] = $verifiedCustomerUsername;
+        }
+        if (!empty($verifiedAdminUsername)) {
+            $cur['adminBotUsername'] = $verifiedAdminUsername;
+            $cur['baleAdminUsername'] = $verifiedAdminUsername;
+        }
+
         return $cur;
     });
 
@@ -2209,18 +2249,8 @@ if ($path === '/api/admin/diagnostics' || $path === '/api/admin/diagnostics/run'
 // GET /api/admin/logs & /api/bot/logs
 if (($path === '/api/admin/logs' || $path === '/api/bot/logs') && $method === 'GET') {
     enforceAdminAuthOrExit($db);
-    $lines = [];
-    if (file_exists($logFile)) {
-        $raw = @file_get_contents($logFile);
-        if ($raw) {
-            $rawLines = array_filter(explode("\n", trim($raw)));
-            foreach (array_slice($rawLines, -100) as $rl) {
-                $dec = @json_decode($rl, true);
-                if (is_array($dec)) $lines[] = $dec;
-            }
-        }
-    }
-    echo json_encode(['ok' => true, 'logs' => array_reverse($lines)]);
+    $logs = getRecentBotActivityLogsPhp(100);
+    echo json_encode(['ok' => true, 'logs' => $logs]);
     exit;
 }
 
@@ -2229,6 +2259,9 @@ if (($path === '/api/bot/logs' || $path === '/api/admin/logs') && $method === 'D
     if (file_exists($logFile)) {
         @file_put_contents($logFile, '');
     }
+    withDatabaseTransaction(function(&$dbRef) {
+        $dbRef['botActivityLogs'] = [];
+    });
     echo json_encode(['ok' => true, 'message' => 'تاریخچه لاگ‌ها پاکسازی شد']);
     exit;
 }

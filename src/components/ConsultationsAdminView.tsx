@@ -34,6 +34,7 @@ import {
   ContactMessage
 } from '../types';
 import { getReceiptImageUrlWithAuth } from '../services/dataService';
+import { AuthenticatedReceiptImage } from './AuthenticatedReceiptImage';
 
 interface ConsultationsAdminViewProps {
   siteContent: SiteContent;
@@ -853,12 +854,17 @@ export const ConsultationsAdminView: React.FC<ConsultationsAdminViewProps> = ({
                   {item.receiptImage && item.order && (
                     <div className="mb-4 p-4 rounded-2xl bg-amber-50/80 border border-amber-200 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
                       <div className="flex items-center gap-3">
-                        <img
-                          src={getReceiptImageUrlWithAuth(item.receiptImage)}
-                          alt="فیش واریزی مشاوره"
+                        <div
                           onClick={() => setPreviewReceiptOrder(item.order!)}
-                          className="w-16 h-16 object-cover rounded-xl border-2 border-white shadow-sm cursor-pointer hover:scale-105 transition"
-                        />
+                          className="w-16 h-16 rounded-xl overflow-hidden border-2 border-white shadow-sm cursor-pointer hover:scale-105 transition shrink-0"
+                          title="کلیک برای بزرگنمایی فیش"
+                        >
+                          <AuthenticatedReceiptImage
+                            src={item.receiptImage}
+                            alt="فیش واریزی مشاوره"
+                            className="w-full h-full object-cover"
+                          />
+                        </div>
                         <div className="text-xs space-y-1">
                           <div className="font-black text-amber-950">
                             تصویر فیش واریزی پیوست شده به فاکتور مشاوره ({item.trackingCode})
@@ -1496,8 +1502,8 @@ export const ConsultationsAdminView: React.FC<ConsultationsAdminViewProps> = ({
             </div>
 
             <div className="bg-slate-950 rounded-2xl p-3 flex items-center justify-center max-h-96 overflow-hidden">
-              <img
-                src={getReceiptImageUrlWithAuth(previewReceiptOrder.receiptImage || previewReceiptOrder.receiptImageUrl)}
+              <AuthenticatedReceiptImage
+                src={previewReceiptOrder.receiptImage || previewReceiptOrder.receiptImageUrl}
                 alt="Receipt"
                 className="max-h-80 object-contain rounded-xl"
               />

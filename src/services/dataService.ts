@@ -98,14 +98,21 @@ export function hasAdminSession(): boolean {
 
 export function getReceiptImageUrlWithAuth(url?: string): string {
   if (!url) return '';
-  if (url.startsWith('/api/admin/receipts/')) {
-    const token = getAdminSessionToken();
-    if (token) {
-      const separator = url.includes('?') ? '&' : '?';
-      return `${url}${separator}token=${encodeURIComponent(token)}`;
-    }
+  // Map any legacy /api/receipts/ path to canonical /api/admin/receipts/
+  if (url.startsWith('/api/receipts/')) {
+    return '/api/admin/receipts/' + url.slice('/api/receipts/'.length);
   }
   return url;
+}
+
+export async function fetchReceiptImageBlobUrl(url: string): Promise<string> {
+  const targetUrl = getReceiptImageUrlWithAuth(url);
+  const res = await apiFetch(targetUrl);
+  if (!res.ok) {
+    throw new Error(`Failed to load receipt image: HTTP ${res.status}`);
+  }
+  const blob = await res.blob();
+  return URL.createObjectURL(blob);
 }
 
 export function normalizeState(partial?: Partial<FullOnivalCloudState> | null): FullOnivalCloudState {

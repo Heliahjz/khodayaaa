@@ -28,6 +28,7 @@ import {
 } from 'lucide-react';
 import { Order } from '../types';
 import { apiFetch, getReceiptImageUrlWithAuth } from '../services/dataService';
+import { AuthenticatedReceiptImage } from './AuthenticatedReceiptImage';
 
 interface OrdersViewProps {
   orders: Order[];
@@ -826,8 +827,8 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                       className="w-20 h-20 rounded-xl overflow-hidden border-2 border-amber-300 bg-white shrink-0 cursor-pointer relative group shadow-xs"
                       title="کلیک برای بزرگنمایی تصویر فیش واریزی"
                     >
-                      <img
-                        src={getReceiptImageUrlWithAuth(order.receiptImageUrl)}
+                      <AuthenticatedReceiptImage
+                        src={order.receiptImageUrl || order.receiptImage}
                         alt={`فیش واریزی فاکتور ${order.trackingCode}`}
                         className="w-full h-full object-cover group-hover:scale-105 transition"
                       />
@@ -1061,9 +1062,9 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
               )}
             </div>
 
-            <div className="rounded-2xl overflow-hidden border border-slate-200 bg-slate-100 max-h-96 flex items-center justify-center">
-              <img
-                src={getReceiptImageUrlWithAuth(previewOrderReceipt.receiptImageUrl)}
+            <div className="rounded-2xl overflow-hidden border border-slate-200 bg-slate-100 max-h-96 flex items-center justify-center p-2">
+              <AuthenticatedReceiptImage
+                src={previewOrderReceipt.receiptImageUrl || previewOrderReceipt.receiptImage}
                 alt={`فیش فاکتور ${previewOrderReceipt.trackingCode}`}
                 className="max-h-96 w-auto object-contain mx-auto"
               />

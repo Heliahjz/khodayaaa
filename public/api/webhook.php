@@ -204,11 +204,19 @@ $correlationId = onival_log('webhook', 'update_received', 'Received update from 
 if (isset($update['pre_checkout_query'])) {
     $pcq = $update['pre_checkout_query'];
     $pcqId = $pcq['id'] ?? '';
-    $orderPayload = $pcq['invoice_payload'] ?? '';
-    $cleanOrderCode = str_replace(['_', 'pay-', 'order-'], ['-', '', ''], $orderPayload);
+    $orderPayload = trim((string)($pcq['invoice_payload'] ?? ''));
+
+    $cleanOrderCode = '';
+    $targetAttemptId = '';
+    if (preg_match('/^pay_([A-Za-z0-9-]+)(?:_([a-zA-Z0-9]+))?$/', $orderPayload, $pm)) {
+        $cleanOrderCode = $pm[1];
+        $targetAttemptId = $pm[2] ?? '';
+    } else {
+        $cleanOrderCode = str_replace(['_', 'pay-', 'order-'], ['-', '', ''], $orderPayload);
+    }
 
     $matchedOrder = findOrderByCodePhp($db['orders'] ?? [], $cleanOrderCode);
-    $paidRials = intval($pcq['total_amount'] ?? 0);
+    $paidRials = (int)($pcq['total_amount'] ?? 0);
 
     if (!$matchedOrder) {
         callBaleApi($activeToken, 'answerPreCheckoutQuery', [
@@ -217,6 +225,50 @@ if (isset($update['pre_checkout_query'])) {
             'error_message' => 'فاکتور سفارش در سیستم یافت نشد.'
         ]);
         echo json_encode(['ok' => false, 'error' => 'Order not found']);
+        exit;
+    }
+
+    if (($pcq['currency'] ?? '') !== 'IRR') {
+        callBaleApi($activeToken, 'answerPreCheckoutQuery', [
+            'pre_checkout_query_id' => $pcqId,
+            'ok' => false,
+            'error_message' => 'ارز معتبر جهت پرداخت ریال (IRR) می‌باشد.'
+        ]);
+        echo json_encode(['ok' => false, 'error' => 'Invalid currency']);
+        exit;
+    }
+
+    // Match exact persisted payment attempt
+    $exactAttempt = null;
+    if (!empty($matchedOrder['paymentAttempts']) && is_array($matchedOrder['paymentAttempts'])) {
+        foreach ($matchedOrder['paymentAttempts'] as $att) {
+            if (($att['payload'] ?? '') === $orderPayload || (!empty($targetAttemptId) && ($att['attemptId'] ?? '') === $targetAttemptId)) {
+                $exactAttempt = $att;
+                break;
+            }
+        }
+    }
+
+    if (!$exactAttempt) {
+        callBaleApi($activeToken, 'answerPreCheckoutQuery', [
+            'pre_checkout_query_id' => $pcqId,
+            'ok' => false,
+            'error_message' => 'شناسه فاکتور پرداخت صادرشده یافت نشد یا منقضی گردیده است.'
+        ]);
+        echo json_encode(['ok' => false, 'error' => 'Payment attempt not found']);
+        exit;
+    }
+
+    // Validate customer chat association
+    $fromId = preg_replace('/\D/', '', (string)($pcq['from']['id'] ?? ''));
+    $boundChat = (string)($matchedOrder['baleChatId'] ?? ($matchedOrder['chatId'] ?? ''));
+    if ($boundChat !== '' && !empty($fromId) && $boundChat !== $fromId) {
+        callBaleApi($activeToken, 'answerPreCheckoutQuery', [
+            'pre_checkout_query_id' => $pcqId,
+            'ok' => false,
+            'error_message' => 'این فاکتور متعلق به حساب کاربری دیگری است.'
+        ]);
+        echo json_encode(['ok' => false, 'error' => 'Customer chat mismatch']);
         exit;
     }
 
@@ -240,21 +292,20 @@ if (isset($update['pre_checkout_query'])) {
         exit;
     }
 
-    $expectedToman = getOrderAmountTomanPhp($matchedOrder);
-    $expectedRials = round($expectedToman * 10);
-
-    if ($expectedRials > 0 && $paidRials < $expectedRials) {
+    // Exact integer comparison of payment amount in Rials
+    $expectedRials = (int)($exactAttempt['amountRials'] ?? round(getOrderAmountTomanPhp($matchedOrder) * 10));
+    if ($paidRials !== $expectedRials) {
         callBaleApi($activeToken, 'answerPreCheckoutQuery', [
             'pre_checkout_query_id' => $pcqId,
             'ok' => false,
-            'error_message' => 'مبلغ پرداختی کمتر از مبلغ فاکتور سفارش است.'
+            'error_message' => 'مبلغ تراکنش با فاکتور صادر شده مطابقت دقیق ندارد.'
         ]);
-        onival_log('payment', 'pre_checkout_underpaid', 'Amount mismatch in pre_checkout_query', [
+        onival_log('payment', 'pre_checkout_amount_mismatch', 'Amount mismatch in pre_checkout_query', [
             'orderCode' => $cleanOrderCode,
             'paidRials' => $paidRials,
             'expectedRials' => $expectedRials
         ], $correlationId);
-        echo json_encode(['ok' => false, 'error' => 'Insufficient payment amount']);
+        echo json_encode(['ok' => false, 'error' => 'Exact payment amount mismatch']);
         exit;
     }
 
@@ -279,7 +330,7 @@ if (isset($update['pre_checkout_query'])) {
         'ok' => true
     ]);
 
-    onival_log('payment', 'pre_checkout_approved', "Pre-checkout approved for {$cleanOrderCode}", [], $correlationId);
+    onival_log('payment', 'pre_checkout_approved', "Pre-checkout approved for {$cleanOrderCode} (attempt: {$exactAttempt['attemptId']})", [], $correlationId);
     echo json_encode(['ok' => true]);
     exit;
 }
@@ -456,61 +507,113 @@ $mainKeyboard = [
 // ------------------------------------------------------------------------------
 if (isset($message['successful_payment'])) {
     $sp = $message['successful_payment'];
-    $orderPayload = $sp['invoice_payload'] ?? '';
-    $cleanOrderCode = str_replace(['_', 'pay-', 'order-'], ['-', '', ''], $orderPayload);
-    $paidRials = intval($sp['total_amount'] ?? 0);
-    $balePaymentId = $sp['provider_payment_charge_id'] ?? $sp['telegram_payment_charge_id'] ?? ('BALE-' . time());
+    $orderPayload = trim((string)($sp['invoice_payload'] ?? ''));
 
-    $isTestMode = ($paymentMode === 'test' || strpos((string)$balePaymentId, 'TEST') !== false || strpos((string)$walletToken, 'WALLET-TEST') !== false || strpos((string)$orderPayload, 'test') !== false);
+    $cleanOrderCode = '';
+    $targetAttemptId = '';
+    if (preg_match('/^pay_([A-Za-z0-9-]+)(?:_([a-zA-Z0-9]+))?$/', $orderPayload, $pm)) {
+        $cleanOrderCode = $pm[1];
+        $targetAttemptId = $pm[2] ?? '';
+    } else {
+        $cleanOrderCode = str_replace(['_', 'pay-', 'order-'], ['-', '', ''], $orderPayload);
+    }
 
-    $txRes = withDatabaseTransaction(function(&$dbRef) use ($cleanOrderCode, $paidRials, $balePaymentId, $chatId, $isTestMode) {
+    $paidRials = (int)($sp['total_amount'] ?? 0);
+    $balePaymentId = trim((string)($sp['provider_payment_charge_id'] ?? $sp['telegram_payment_charge_id'] ?? ('BALE-' . time())));
+
+    $txRes = withDatabaseTransaction(function(&$dbRef) use ($cleanOrderCode, $orderPayload, $targetAttemptId, $paidRials, $balePaymentId, $chatId) {
         $order = findOrderByCodePhp($dbRef['orders'] ?? [], $cleanOrderCode);
         if (!$order) {
-            return ['ok' => false, 'error' => 'Order not found'];
+            return ['ok' => false, 'error' => 'Order not found', 'unknownOrder' => true];
         }
 
-        $expectedToman = getOrderAmountTomanPhp($order);
-        $expectedRials = round($expectedToman * 10);
-        if ($expectedRials > 0 && $paidRials < $expectedRials) {
-            return ['ok' => false, 'error' => 'Underpaid'];
+        // Cross-order charge ID deduplication: ensure charge ID was not used on another order
+        foreach ($dbRef['orders'] as $ordItem) {
+            if (($ordItem['trackingCode'] ?? '') !== $order['trackingCode']) {
+                if (($ordItem['balePaymentRef'] ?? '') === $balePaymentId) {
+                    return ['ok' => false, 'error' => 'Provider charge ID already used on another order', 'duplicateCharge' => true];
+                }
+                if (!empty($ordItem['paymentAttempts']) && is_array($ordItem['paymentAttempts'])) {
+                    foreach ($ordItem['paymentAttempts'] as $pa) {
+                        if (($pa['chargeId'] ?? '') === $balePaymentId) {
+                            return ['ok' => false, 'error' => 'Provider charge ID already used on another order', 'duplicateCharge' => true];
+                        }
+                    }
+                }
+            }
         }
 
-        if ($isTestMode) {
-            // SAFETY RULE: Test payment must NEVER mark production order as Paid or deduct stock
+        // Locate exact persisted attempt
+        $matchedAttemptIdx = -1;
+        if (!empty($order['paymentAttempts']) && is_array($order['paymentAttempts'])) {
+            foreach ($order['paymentAttempts'] as $idx => $att) {
+                if (($att['payload'] ?? '') === $orderPayload || (!empty($targetAttemptId) && ($att['attemptId'] ?? '') === $targetAttemptId)) {
+                    $matchedAttemptIdx = $idx;
+                    break;
+                }
+            }
+        }
+
+        // Unknown or unreconcilable attempt payload -> mark review required, DO NOT mark Paid
+        if ($matchedAttemptIdx === -1) {
+            foreach ($dbRef['orders'] as &$ord) {
+                if (($ord['trackingCode'] ?? '') === $order['trackingCode']) {
+                    $ord['paymentReviewRequired'] = true;
+                    $ord['paymentReviewReason'] = 'شناسه فاکتور پرداخت منطبق بر تلاش‌های ثبت‌شده نیست: ' . $orderPayload;
+                    $ord['paymentStatus'] = 'PAYMENT_REVIEW_REQUIRED';
+                    $ord['balePaymentRef'] = $balePaymentId;
+                    $ord['baleChatId'] = $chatId;
+                    break;
+                }
+            }
+            return ['ok' => false, 'error' => 'Unknown attempt payload', 'reviewRequired' => true, 'order' => $order];
+        }
+
+        $matchedAttempt = $order['paymentAttempts'][$matchedAttemptIdx];
+        // Immutable issuance mode from attempt itself (never inferred from current server config)
+        $isAttemptTest = (($matchedAttempt['mode'] ?? '') === 'test');
+
+        // Exact integer Rial comparison
+        $expectedRials = (int)($matchedAttempt['amountRials'] ?? round(getOrderAmountTomanPhp($order) * 10));
+        if ($paidRials !== $expectedRials) {
+            foreach ($dbRef['orders'] as &$ord) {
+                if (($ord['trackingCode'] ?? '') === $order['trackingCode']) {
+                    $ord['paymentReviewRequired'] = true;
+                    $ord['paymentReviewReason'] = "عدم تطابق دقیق مبلغ: پرداختی {$paidRials} ریال در برابر مورد انتظار {$expectedRials} ریال";
+                    $ord['paymentStatus'] = 'PAYMENT_REVIEW_REQUIRED';
+                    $ord['balePaymentRef'] = $balePaymentId;
+                    $ord['baleChatId'] = $chatId;
+                    break;
+                }
+            }
+            return ['ok' => false, 'error' => 'Exact amount mismatch', 'reviewRequired' => true, 'order' => $order];
+        }
+
+        // Idempotency check: if already processed with this charge ID
+        if (($order['balePaymentRef'] ?? '') === $balePaymentId || ($matchedAttempt['chargeId'] ?? '') === $balePaymentId) {
+            return ['ok' => true, 'alreadyPaid' => true, 'isTest' => $isAttemptTest, 'order' => $order];
+        }
+        if (($order['paymentStatus'] ?? '') === 'Paid' && !$isAttemptTest) {
+            return ['ok' => true, 'alreadyPaid' => true, 'isTest' => false, 'order' => $order];
+        }
+
+        if ($isAttemptTest) {
+            // SAFETY RULE: Test attempts can NEVER mark production orders as Paid or deduct stock
             foreach ($dbRef['orders'] as &$ord) {
                 if (($ord['trackingCode'] ?? '') === $order['trackingCode']) {
                     $ord['testPaymentStatus'] = 'TestPaidVerified';
                     $ord['testPaymentChargeId'] = $balePaymentId;
                     $ord['testPaymentAt'] = date('c');
                     $ord['baleChatId'] = $chatId;
-                    if (!isset($ord['paymentAttempts']) || !is_array($ord['paymentAttempts'])) $ord['paymentAttempts'] = [];
-                    $ord['paymentAttempts'][] = [
-                        'mode' => 'test',
-                        'chargeId' => $balePaymentId,
-                        'amountRials' => $paidRials,
-                        'time' => date('c'),
-                        'status' => 'verified_test'
-                    ];
-                    if (count($ord['paymentAttempts']) > 10) {
-                        $ord['paymentAttempts'] = array_slice($ord['paymentAttempts'], -10);
-                    }
+                    $ord['paymentAttempts'][$matchedAttemptIdx]['status'] = 'verified_test';
+                    $ord['paymentAttempts'][$matchedAttemptIdx]['chargeId'] = $balePaymentId;
+                    $ord['paymentAttempts'][$matchedAttemptIdx]['paidAt'] = date('c');
                     return ['ok' => true, 'isTest' => true, 'order' => $ord];
                 }
             }
         }
 
-        // Idempotency check: if already paid or charge already processed, do not re-deduct
-        if (($order['paymentStatus'] ?? '') === 'Paid') {
-            return ['ok' => true, 'alreadyPaid' => true, 'order' => $order];
-        }
-        if (isset($order['paymentAttempts']) && is_array($order['paymentAttempts'])) {
-            foreach ($order['paymentAttempts'] as $att) {
-                if (($att['chargeId'] ?? '') === $balePaymentId && ($att['status'] ?? '') === 'paid_success') {
-                    return ['ok' => true, 'alreadyPaid' => true, 'order' => $order];
-                }
-            }
-        }
-
+        // Live attempt: verify and deduct inventory atomically
         $invRes = deductOrderInventory($dbRef, $order);
         if (!$invRes['ok']) {
             foreach ($dbRef['orders'] as &$ord) {
@@ -523,7 +626,7 @@ if (isset($message['successful_payment'])) {
                     break;
                 }
             }
-            return ['ok' => false, 'error' => $invRes['error'], 'reviewMarked' => true];
+            return ['ok' => false, 'error' => $invRes['error'], 'reviewMarked' => true, 'order' => $order];
         }
 
         foreach ($dbRef['orders'] as &$ord) {
@@ -536,18 +639,10 @@ if (isset($message['successful_payment'])) {
                 $ord['baleChatId'] = $chatId;
                 $ord['paidAt'] = date('c');
                 $ord['inventoryDeducted'] = true;
-                if (!isset($ord['paymentAttempts']) || !is_array($ord['paymentAttempts'])) $ord['paymentAttempts'] = [];
-                $ord['paymentAttempts'][] = [
-                    'mode' => 'live',
-                    'chargeId' => $balePaymentId,
-                    'amountRials' => $paidRials,
-                    'time' => date('c'),
-                    'status' => 'paid_success'
-                ];
-                if (count($ord['paymentAttempts']) > 10) {
-                    $ord['paymentAttempts'] = array_slice($ord['paymentAttempts'], -10);
-                }
-                return ['ok' => true, 'order' => $ord];
+                $ord['paymentAttempts'][$matchedAttemptIdx]['status'] = 'paid_success';
+                $ord['paymentAttempts'][$matchedAttemptIdx]['chargeId'] = $balePaymentId;
+                $ord['paymentAttempts'][$matchedAttemptIdx]['paidAt'] = date('c');
+                return ['ok' => true, 'isTest' => false, 'order' => $ord];
             }
         }
         return ['ok' => false, 'error' => 'Update failed'];
